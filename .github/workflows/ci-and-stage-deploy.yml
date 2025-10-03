@@ -22,6 +22,27 @@ jobs:
       # It automatically sets the 'prefix' variable in your variables.tf file
       TF_VAR_prefix: "stg${{ github.run_id }}"
 
+    # This creates temporary database containers for the unit tests to run against.
+    services:
+      product_db:
+        image: postgres:15
+        env: {POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: products}
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 10s --health-timeout 5s --health-retries 5
+        ports: ['5432:5432']
+      order_db:
+        image: postgres:15
+        env: {POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: orders}
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 10s --health-timeout 5s --health-retries 5
+        ports: ['5433:5432']
+      customer_db:
+        image: postgres:15
+        env: {POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: customers}
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 10s --health-timeout 5s --health-retries 5
+        ports: ['5434:5432']
+
     steps:
       # This step must be first to authenticate all subsequent Azure steps
       - name: Azure Login
@@ -31,6 +52,59 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: | # Use a multi-line script to install pip dependencies
+          pip install --upgrade pip
+          # Loop through each backend service folder
+          for req in backend/*/requirements.txt; do
+            echo "Installing $req"
+            pip install -r "$req"
+          done
+          # Install CI tools
+          pip install pytest httpx
+
+      # For below two steps, always make sure the ports are correct and match the mapping specified in the aforementioned services
+      # Run tests for product service
+      - name: Run product_service tests
+        working-directory: backend/product_service
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432 
+          POSTGRES_DB: products
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        run: |
+          pytest tests --maxfail=1 --disable-warnings -q
+      
+      # Run tests for order service
+      - name: Run order_service tests
+        working-directory: backend/order_service
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5433 
+          POSTGRES_DB: orders
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        run: |
+          pytest tests --maxfail=1 --disable-warnings -q
+
+      # Run tests for customer service
+      - name: Run customer_service tests
+        working-directory: backend/customer_service
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5434 
+          POSTGRES_DB: customers
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        run: |
+          pytest tests --maxfail=1 --disable-warnings -q
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v2
@@ -123,18 +197,17 @@ jobs:
       # Step 6: Run simple acceptance tests against the live staging environment
       - name: Run Acceptance Tests
         run: |
-          echo "Waiting a moment for frontend to be ready..."
+          echo "Waiting a moment for all services to be ready..."
           sleep 30 
-          echo "--- Acceptance Test Results ---"
-          echo "Testing Product Service Health..."
-          curl -s "http://${{ env.PRODUCT_API_IP }}:8000/health" || exit 1
-          echo "Testing Order Service Health..."
-          curl -s "http://${{ env.ORDER_API_IP }}:8001/health" || exit 1
-          echo "Testing Customer Service Health..."
-          curl -s "http://${{ env.CUSTOMER_API_IP }}:8002/health" || exit 1
-          echo "---------------------------------"
-          echo "All services are healthy. Acceptance tests passed." > test_results.txt
-          cat test_results.txt
+          
+          # Install dependencies for the test script
+          pip install httpx
+          
+          # Execute the acceptance test script with the live service URLs
+          python tests/acceptance_tests.py \
+            --product-url "http://${{ env.PRODUCT_API_IP }}:8000" \
+            --order-url "http://${{ env.ORDER_API_IP }}:8001" \
+            --customer-url "http://${{ env.CUSTOMER_API_IP }}:8002"
 
       # Step 7: Destroy all staging resources. This runs even if tests fail.
       - name: Terraform Destroy (Cleanup Staging Infrastructure)
