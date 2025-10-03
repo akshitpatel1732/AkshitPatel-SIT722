@@ -531,10 +531,4 @@ document.addEventListener('DOMContentLoaded', () => {
     fetchProducts();
     fetchCustomers(); // NEW: Fetch customers on load
     fetchOrders();
-
-    // Set up a periodic refresh for orders (e.g., every 10 seconds)
-    // This helps show asynchronous status updates from RabbitMQ in real-time
-    setInterval(fetchOrders, 10000); // Refresh orders every 10 seconds
-    setInterval(fetchProducts, 15000); // Refresh products every 15 seconds to see stock changes
-
 });

@@ -13,4 +13,3 @@ data:
   PRODUCT_SERVICE_URL: http://product-service-w10:8000
   ORDER_SERVICE_URL: http://order-service-w10:8001
   CUSTOMER_SERVICE_URL: http://customer-service-w10:8002
-  RABBITMQ_HOST: rabbitmq-service-w10
