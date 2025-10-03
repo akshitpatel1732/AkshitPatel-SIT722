@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service-w10
+  labels:
+    app: order-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+      annotations:
+        prometheus.io/scrape: 'true' # Instruct Prometheus to scrape this pod
+        prometheus.io/path: '/metrics' # The path where metrics are exposed
+        prometheus.io/port: '8000' # The port where metrics are exposed on the container
+    spec:
+      containers:
+      - name: order-service-container
+        # Make sure this pattern is not changed. Check .github/workflows/manual-delivery.yml for more information.
+        image: your-acr-name.azurecr.io/order_service:placeholder
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8001
+        env:
+        - name: POSTGRES_HOST
+          value: order-db-service-w10
+        - name: POSTGRES_DB
+          valueFrom:
+            configMapKeyRef:
+              name: ecomm-config-w10
+              key: ORDERS_DB_NAME
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: ecomm-secrets-w10
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ecomm-secrets-w10
+              key: POSTGRES_PASSWORD
+        - name: PRODUCT_SERVICE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: ecomm-config-w10
+              key: PRODUCT_SERVICE_URL
+        - name: RABBITMQ_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: ecomm-config-w10
+              key: RABBITMQ_HOST
+        - name: RABBITMQ_USER
+          valueFrom:
+            secretKeyRef:
+              name: ecomm-secrets-w10
+              key: RABBITMQ_USER
+        - name: RABBITMQ_PASS
+          valueFrom:
+            secretKeyRef:
+              name: ecomm-secrets-w10
+              key: RABBITMQ_PASS
+        - name: CUSTOMER_SERVICE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: ecomm-config-w10
+              key: CUSTOMER_SERVICE_URL
+        
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service-w10
+  labels:
+    app: order-service
+spec:
+  selector:
+    app: order-service
+  ports:
+    - protocol: TCP
+      port: 8001
+      targetPort: 8000
+  type: LoadBalancer
