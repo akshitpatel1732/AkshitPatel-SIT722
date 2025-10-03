@@ -150,7 +150,7 @@ jobs:
         
           # Apply all backend configurations
           kubectl apply -f k8s/configmaps.yaml -f k8s/secrets.yaml -f k8s/product-db.yaml -f k8s/order-db.yaml -f k8s/customer-db.yaml
-          kubectl apply -f k8s/product-service.yaml -f k8s/order-service.yaml -f k8s/customer_service.yaml
+          kubectl apply -f k8s/product-service.yaml -f k8s/order-service.yaml -f k8s/customer-service.yaml
 
       # This step attempts to obtain IPs of deployed backend services
       - name: Wait for Backend IPs
