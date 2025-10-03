@@ -43,15 +43,18 @@ jobs:
           terraform init
           terraform apply -auto-approve
           
-          # Use terraform output to get the names of the created resources
-          echo "STAGING_RG=$(terraform output -raw resource_group_name)" >> $GITHUB_ENV
-          echo "STAGING_AKS_CLUSTER=$(terraform output -raw kubernetes_cluster_name)" >> $GITHUB_ENV
-          echo "STAGING_ACR=$(terraform output -raw container_registry_login_server)" >> $GITHUB_ENV
-          echo "STAGING_STORAGE_ACCOUNT=$(terraform output -raw storage_account_name)" >> $GITHUB_ENV
-          # Capture the sensitive storage key
-          echo "STAGING_STORAGE_KEY=$(terraform output -raw storage_account_primary_key)" >> $GITHUB_ENV
+          echo "Setting environment variables for this staging run..."
+          echo "STAGING_RG=${{ env.TF_VAR_prefix }}" >> $GITHUB_ENV
+          echo "STAGING_AKS_CLUSTER=${{ env.TF_VAR_prefix }}" >> $GITHUB_ENV
+          echo "STAGING_ACR=${{ env.TF_VAR_prefix }}.azurecr.io" >> $GITHUB_ENV
+          echo "STAGING_STORAGE_ACCOUNT=${{ env.TF_VAR_prefix }}" >> $GITHUB_ENV
+          
+          # Fetch the storage account key directly using Azure CLI
+          STORAGE_KEY=$(az storage account keys list --resource-group "${{ env.TF_VAR_prefix }}" --account-name "${{ env.TF_VAR_prefix }}" --query '[0].value' -o tsv)
+          echo "STAGING_STORAGE_KEY=$STORAGE_KEY" >> $GITHUB_ENV
+          
           # Mask the key in the workflow logs so it doesn't get exposed
-          echo "::add-mask::$(terraform output -raw storage_account_primary_key)"
+          echo "::add-mask::$STORAGE_KEY"
 
       # Step 2: Build images and push them to the NEWLY CREATED staging ACR
       - name: Login to Staging ACR & Build/Push Backend Images
