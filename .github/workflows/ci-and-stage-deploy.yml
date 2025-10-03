@@ -194,7 +194,7 @@ jobs:
           # Deploy the frontend
           kubectl apply -f k8s/frontend.yaml
 
-      # Step 6: Run simple acceptance tests against the live staging environment
+      # Step 6: Run acceptance tests against the live staging environment
       - name: Run Acceptance Tests
         run: |
           echo "Waiting a moment for all services to be ready..."
@@ -208,6 +208,50 @@ jobs:
             --product-url "http://${{ env.PRODUCT_API_IP }}:8000" \
             --order-url "http://${{ env.ORDER_API_IP }}:8001" \
             --customer-url "http://${{ env.CUSTOMER_API_IP }}:8002"
+      
+      - name: Scan Images from Staging ACR and Create Issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Define the list of full image names in the staging ACR
+          # We use the STAGING_ACR_LOGIN_SERVER variable set by the Terraform step
+          IMAGES=(
+            "${{ env.STAGING_ACR }}/product_service"
+            "${{ env.STAGING_ACR }}/order_service"
+            "${{ env.STAGING_ACR }}/customer_service"
+            "${{ env.STAGING_ACR }}/frontend"
+          )
+
+          for IMAGE_PATH in "${IMAGES[@]}"; do
+            # Extract the simple name (e.g., "product_service") for a clean issue title
+            IMAGE_NAME=$(basename "$IMAGE_PATH")
+            
+            echo "Scanning $IMAGE_PATH:${{ github.sha }} from registry..."
+            
+            # Run Docker Scout on the full image path in the staging registry
+            docker scout cves "$IMAGE_PATH:${{ github.sha }}" > cve_report.txt || true
+            
+            # Prepare the title and body for the GitHub issue
+            ISSUE_TITLE="Vulnerability Scan Report for $IMAGE_NAME"
+            ISSUE_BODY=$(cat cve_report.txt)
+            
+            FORMATTED_BODY="### Docker Scout Report for \`$IMAGE_NAME\`
+
+            **Image:** \`$IMAGE_PATH:${{ github.sha }}\`
+            **Commit:** \`${{ github.sha }}\`
+
+            This report lists vulnerabilities found in the container image pushed to the staging registry.
+
+            \`\`\`
+            $ISSUE_BODY
+            \`\`\`
+            "
+            
+            # Use the GitHub CLI to create the issue
+            gh issue create --title "$ISSUE_TITLE" --body "$FORMATTED_BODY" --label "vulnerability"
+            
+            echo "GitHub issue created for $IMAGE_NAME."
+          done
 
       # Step 7: Destroy all staging resources. This runs even if tests fail.
       - name: Terraform Destroy (Cleanup Staging Infrastructure)
