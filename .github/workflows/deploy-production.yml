@@ -107,7 +107,7 @@ jobs:
 
       # Make sure correct ACR registry name is present as a GitHub Secret in the repo
       - name: Login to ACR
-        run: az acr login --name ${{ env.ACR_LOGIN_SERVER }}
+        run: az acr login --name ${{ secrets.AZURE_CONTAINER_REGISTRY }}
       
       # This step tells the correct target to Kubernetes
       - name: Set AKS context
