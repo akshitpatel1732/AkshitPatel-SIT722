@@ -42,18 +42,19 @@ jobs:
           cd ./terraform/staging
           terraform init
           terraform apply -auto-approve
+          terraform output -json
           
           # Get all outputs in JSON format once
           TF_OUTPUTS=$(terraform output -json)
           
-          # Use 'jq' to parse the JSON, making sure to QUOTE the variable
-          echo "STAGING_RG=$(echo "$TF_OUTPUTS" | jq -r .resource_group_name.value)" >> $GITHUB_ENV
-          echo "STAGING_AKS_CLUSTER=$(echo "$TF_OUTPUTS" | jq -r .kubernetes_cluster_name.value)" >> $GITHUB_ENV
-          echo "STAGING_ACR=$(echo "$TF_OUTPUTS" | jq -r .container_registry_login_server.value)" >> $GITHUB_ENV
-          echo "STAGING_STORAGE_ACCOUNT=$(echo "$TF_OUTPUTS" | jq -r .storage_account_name.value)" >> $GITHUB_ENV
+          # Use jq to parse the JSON and set environment variables
+          echo "STAGING_RG=$(echo $TF_OUTPUTS | jq -r '.resource_group_name.value')" >> $GITHUB_ENV
+          echo "STAGING_AKS_CLUSTER=$(echo "$TF_OUTPUTS" | jq -r '.kubernetes_cluster_name.value')" >> $GITHUB_ENV
+          echo "STAGING_ACR=$(echo "$TF_OUTPUTS" | jq -r '.container_registry_login_server.value')" >> $GITHUB_ENV
+          echo "STAGING_STORAGE_ACCOUNT=$(echo "$TF_OUTPUTS" | jq -r '.storage_account_name.value')" >> $GITHUB_ENV
           
           # Capture and mask the sensitive storage key
-          STAGING_KEY=$(echo "$TF_OUTPUTS" | jq -r .storage_account_primary_key.value)
+          STAGING_KEY=$(echo "$TF_OUTPUTS" | jq -r '.storage_account_primary_key.value')
           echo "STAGING_STORAGE_KEY=$STAGING_KEY" >> $GITHUB_ENV
           echo "::add-mask::$STAGING_KEY"
 
