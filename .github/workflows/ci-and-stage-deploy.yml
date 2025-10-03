@@ -1,0 +1,150 @@
+name: Deploy to Ephemeral Staging Environment
+
+on:
+  # Allow manual trigger from the Actions tab
+  workflow_dispatch:
+
+  # Trigger automatically on push to the 'testing' branch
+  push:
+    branches:
+      - testing
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+
+jobs:
+  deploy_and_test_staging:
+    name: Create, Deploy, Test, and Destroy Staging
+    runs-on: ubuntu-latest
+    environment: Staging
+    env:
+      # This TF_VAR_ makes every staging environment unique to prevent conflicts
+      # It automatically sets the 'prefix' variable in your variables.tf file
+      TF_VAR_prefix: "stg${{ github.run_id }}"
+
+    steps:
+      # This step must be first to authenticate all subsequent Azure steps
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      # Step 1: Create the entire staging infrastructure
+      - name: Terraform Apply (Create Staging Infrastructure)
+        id: tf_apply
+        run: |
+          cd ./terraform/staging
+          terraform init
+          terraform apply -auto-approve
+          
+          # Use terraform output to get the names of the created resources
+          echo "STAGING_RG=$(terraform output -raw resource_group_name)" >> $GITHUB_ENV
+          echo "STAGING_AKS_CLUSTER=$(terraform output -raw kubernetes_cluster_name)" >> $GITHUB_ENV
+          echo "STAGING_ACR=$(terraform output -raw container_registry_login_server)" >> $GITHUB_ENV
+          echo "STAGING_STORAGE_ACCOUNT=$(terraform output -raw storage_account_name)" >> $GITHUB_ENV
+          # Capture the sensitive storage key
+          echo "STAGING_STORAGE_KEY=$(terraform output -raw storage_account_primary_key)" >> $GITHUB_ENV
+          # Mask the key in the workflow logs so it doesn't get exposed
+          echo "::add-mask::$(terraform output -raw storage_account_primary_key)"
+
+      # Step 2: Build images and push them to the NEWLY CREATED staging ACR
+      - name: Login to Staging ACR & Build/Push Backend Images
+        run: |
+          az acr login --name ${{ env.STAGING_ACR }}
+          docker build -t ${{ env.STAGING_ACR }}/product_service:${{ github.sha }} ./backend/product_service/
+          docker push ${{ env.STAGING_ACR }}/product_service:${{ github.sha }}
+          docker build -t ${{ env.STAGING_ACR }}/order_service:${{ github.sha }} ./backend/order_service/
+          docker push ${{ env.STAGING_ACR }}/order_service:${{ github.sha }}
+          docker build -t ${{ env.STAGING_ACR }}/customer_service:${{ github.sha }} ./backend/customer_service/
+          docker push ${{ env.STAGING_ACR }}/customer_service:${{ github.sha }}
+      
+      # Step 3: Deploy all backend services to the new AKS cluster
+      - name: Deploy Backend Services to Staging AKS
+        run: |
+          # Get credentials for the new AKS cluster
+          az aks get-credentials --resource-group ${{ env.STAGING_RG }} --name ${{ env.STAGING_AKS_CLUSTER }} --overwrite-existing
+
+          # Update secrets.yaml with staging storage account name
+          B64_STORAGE_NAME=$(echo -n "${{ env.STAGING_STORAGE_ACCOUNT }}" | base64)
+          B64_STORAGE_KEY=$(echo -n "${{ env.STAGING_STORAGE_KEY }}" | base64 | tr -d '\n')
+          sed -i "s|AZURE_STORAGE_ACCOUNT_NAME: \"\"|AZURE_STORAGE_ACCOUNT_NAME: \"$B64_STORAGE_NAME\"|g" k8s/secrets.yaml
+          sed -i "s|AZURE_STORAGE_ACCOUNT_KEY: \"\"|AZURE_STORAGE_ACCOUNT_KEY: \"$B64_STORAGE_KEY\"|g" k8s/secrets.yaml
+
+          # Update backend manifests with the correct staging ACR and image tag
+          sed -i "s|image: .*product_service:.*|image: ${{ env.STAGING_ACR }}/product_service:${{ github.sha }}|g" k8s/product-service.yaml
+          sed -i "s|image: .*order_service:.*|image: ${{ env.STAGING_ACR }}/order_service:${{ github.sha }}|g" k8s/order-service.yaml
+          sed -i "s|image: .*customer_service:.*|image: ${{ env.STAGING_ACR }}/customer_service:${{ github.sha }}|g" k8s/customer-service.yaml
+
+          # Apply all backend configurations
+          kubectl apply -f k8s/configmaps.yaml -f k8s/secrets.yaml -f k8s/product-db.yaml -f k8s/order-db.yaml -f k8s/customer-db.yaml
+          kubectl apply -f k8s/product-service.yaml -f k8s/order-service.yaml -f k8s/customer-service.yaml
+
+      # Step 4: Wait for backend IPs to be assigned
+      - name: Wait for Backend IPs
+        id: get_ips
+        run: |
+          echo "Waiting for backend LoadBalancer IPs..."
+          kubectl wait --for=jsonpath='{.status.loadBalancer.ingress}' service/product-service-w10 --timeout=5m
+          kubectl wait --for=jsonpath='{.status.loadBalancer.ingress}' service/order-service-w10 --timeout=5m
+          kubectl wait --for=jsonpath='{.status.loadBalancer.ingress}' service/customer-service-w10 --timeout=5m
+
+          echo "Fetching IPs..."
+          echo "PRODUCT_API_IP=$(kubectl get service product-service-w10 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')" >> $GITHUB_ENV
+          echo "ORDER_API_IP=$(kubectl get service order-service-w10 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')" >> $GITHUB_ENV
+          echo "CUSTOMER_API_IP=$(kubectl get service customer-service-w10 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')" >> $GITHUB_ENV
+
+      # Step 5: Configure, build, and deploy the frontend
+      - name: Configure, Build and Deploy Frontend
+        run: |
+          # Inject the now-known backend IPs into the frontend code
+          sed -i "s|_PRODUCT_API_URL_|http://${{ env.PRODUCT_API_IP }}:8000|g" frontend/main.js
+          sed -i "s|_ORDER_API_URL_|http://${{ env.ORDER_API_IP }}:8001|g" frontend/main.js
+          sed -i "s|_CUSTOMER_API_URL_|http://${{ env.CUSTOMER_API_IP }}:8002|g" frontend/main.js
+
+          # Build and push the CONFIGURED frontend image to the staging ACR
+          docker build -t ${{ env.STAGING_ACR }}/frontend:${{ github.sha }} ./frontend/
+          docker push ${{ env.STAGING_ACR }}/frontend:${{ github.sha }}
+
+          # Update the frontend manifest with the staging ACR and tag
+          sed -i "s|image:.*frontend:.*|image: ${{ env.STAGING_ACR }}/frontend:${{ github.sha }}|g" k8s/frontend.yaml
+
+          # Deploy the frontend
+          kubectl apply -f k8s/frontend.yaml
+
+      # Step 6: Run simple acceptance tests against the live staging environment
+      - name: Run Acceptance Tests
+        run: |
+          echo "Waiting a moment for frontend to be ready..."
+          sleep 30 
+          echo "--- Acceptance Test Results ---"
+          echo "Testing Product Service Health..."
+          curl -s "http://${{ env.PRODUCT_API_IP }}:8000/health" || exit 1
+          echo "Testing Order Service Health..."
+          curl -s "http://${{ env.ORDER_API_IP }}:8001/health" || exit 1
+          echo "Testing Customer Service Health..."
+          curl -s "http://${{ env.CUSTOMER_API_IP }}:8002/health" || exit 1
+          echo "---------------------------------"
+          echo "All services are healthy. Acceptance tests passed." > test_results.txt
+          cat test_results.txt
+
+      # Step 7: Destroy all staging resources. This runs even if tests fail.
+      - name: Terraform Destroy (Cleanup Staging Infrastructure)
+        if: always() 
+        run: |
+          echo "Cleaning up staging environment..."
+          cd ./terraform/staging
+          terraform destroy -auto-approve
+
+      # This final step always runs to ensure you are logged out.
+      - name: Azure Logout
+        if: always()
+        run: |
+          az logout
+          az cache purge
+          az account clear

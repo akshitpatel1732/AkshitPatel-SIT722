@@ -1,0 +1,212 @@
+name: Deploy to Prod
+
+on: 
+  # Can be run manually
+  workflow_dispatch:
+    # But requires some input values
+    inputs:
+      image_tag:
+        description: 'Image tag (Git SHA) to deploy' # Used to identify the correct set of images to be deployed
+        required: true
+      aks_cluster_name:
+        description: 'Target AKS Cluster Name'
+        required: true
+        default: 'staging-aks-cluster'
+      aks_resource_group:
+        description: 'Target AKS Resource Group'
+        required: true
+        default: 'staging-rg'
+      azure_storage_account_name: 
+        description: 'Azure Storage Account Name for the application' # Will be used to update k8s/secrets.yaml
+        required: true
+        default: 'stagingstorageaccount'
+  
+  # Can also be triggered on PR merge to main for Continuous Deployment to a default env
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+# This workflow needs AZURE_STORAGE_KEY stored as a repo secret for GitHub Actions
+# This value is required and needs to be inserted in k8s/secrets.yaml in base64
+env:
+  AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }} 
+
+# We will specify our job(s) below
+jobs:
+  # We only have one job, everything needs to be run sequentially.
+  # Having multiple chained jobs can also work, but this is simple.
+  deploy:
+    # Only run if the workflow is triggered manually or via a successful PR to main
+    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.merged == true)
+    runs-on: ubuntu-latest # The VM used by GitHub Actions
+    environment: Production # The environment value is used for configuration and optimization purposes
+
+    # Below are the steps to be performed for this job
+    steps:
+      # This step dynamically sets variables based on the trigger
+      # This is done to allow the workflow to be flexible.
+      # A successful PR to main branch will signify that the successful validation and will result in deployment to prod environment
+      # A manual trigger will signify staging process to temporary infrastructure.
+      # This step allows the workflow to work for both Continuous Delivery and Continuous Deployment to an extent
+      - name: Set deployment variables
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # Set environment variables from input values for staging
+            echo "TRIGGER_TYPE=manual" >> $GITHUB_ENV
+            echo "IMAGE_TAG=${{ github.event.inputs.image_tag }}" >> $GITHUB_ENV
+            echo "AKS_CLUSTER=${{ github.event.inputs.aks_cluster_name }}" >> $GITHUB_ENV
+            echo "AKS_RG=${{ github.event.inputs.aks_resource_group }}" >> $GITHUB_ENV
+            echo "STORAGE_ACCOUNT=${{ github.event.inputs.azure_storage_account_name }}" >> $GITHUB_ENV 
+          else
+            # Set environment variables from existing prod environment 
+            echo "TRIGGER_TYPE=automatic" >> $GITHUB_ENV
+            echo "IMAGE_TAG=${{ github.event.pull_request.merge_commit_sha }}" >> $GITHUB_ENV
+            echo "AKS_CLUSTER=224579861week10prod" >> $GITHUB_ENV 
+            echo "AKS_RG=224579861week10prod" >> $GITHUB_ENV             
+            echo "STORAGE_ACCOUNT=224579861week10prod" >> $GITHUB_ENV 
+          fi
+      
+      # The below step ensures that we checkout the correct commit
+      - name: Checkout specific commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.IMAGE_TAG }}
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5 # Action to set up Python environment
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: | # Use a multi-line script to install pip dependencies
+          pip install --upgrade pip
+          # Loop through each backend service folder
+          for req in backend/*/requirements.txt; do
+            echo "Installing $req"
+            pip install -r "$req"
+          done
+
+      # This step requires AZURE_CREDENTIALS secret to be stored as a repo secret for GitHub Actions
+      # Store the Service Principal JSON as the secret value in the following format:
+      # {
+      #   "clientId": "<Client ID>",
+      #   "clientSecret": "<Client Secret>",
+      #   "subscriptionId": "<Subscription ID>",
+      #   "tenantId": "<Tenant ID>"
+      # }
+
+      # The clientId and tenantId can be easily obtained from the app's registration page
+      # For clientSecret, there is an option to create secret in the app's registration page. Create and use that.
+      # The subscriptionId can be obtained from the Azure portal.
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Make sure correct ACR registry name is present as a GitHub Secret in the repo
+      - name: Login to ACR
+        run: az acr login --name ${{ env.ACR_LOGIN_SERVER }}
+      
+      # This step tells the correct target to Kubernetes
+      - name: Set AKS context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.AKS_RG }}
+          cluster-name: ${{ env.AKS_CLUSTER }}
+
+      # This step updates the k8s/secrets.yaml file
+      # The patterns must match in secrets.yaml manifest to update correct values
+      - name: Update secrets.yaml 
+        run: |
+          # Base64 encode the values, as Kubernetes requires
+          B64_STORAGE_NAME=$(echo -n "${{ env.STORAGE_ACCOUNT }}" | base64)
+          B64_STORAGE_KEY=$(echo -n "${{ env.AZURE_STORAGE_KEY }}" | base64 | tr -d '\n')
+          
+          # Use sed to replace the empty values in the secrets file
+          sed -i "s|AZURE_STORAGE_ACCOUNT_NAME: \"\"|AZURE_STORAGE_ACCOUNT_NAME: \"$B64_STORAGE_NAME\"|g" k8s/secrets.yaml
+          sed -i "s|AZURE_STORAGE_ACCOUNT_KEY: \"\"|AZURE_STORAGE_ACCOUNT_KEY: \"$B64_STORAGE_KEY\"|g" k8s/secrets.yaml
+          
+          echo "secrets.yaml configured."
+
+      # This step updates backend manifests and applies configuration
+      # The patterns must match in backend manifests to update correct image tags
+      - name: Build and Deploy Backend
+        run: |
+          # Build and push the images to ACR
+          docker build -t ${{ secrets.AZURE_CONTAINER_REGISTRY }}/product_service:${{ env.IMAGE_TAG }} ./backend/product_service/
+          docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/product_service:${{ env.IMAGE_TAG }}
+          docker build -t ${{ secrets.AZURE_CONTAINER_REGISTRY }}/order_service:${{ env.IMAGE_TAG }} ./backend/order_service/
+          docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/order_service:${{ env.IMAGE_TAG }}
+          docker build -t ${{ secrets.AZURE_CONTAINER_REGISTRY }}/customer_service:${{ env.IMAGE_TAG }} ./backend/customer_service/
+          docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/customer_service:${{ env.IMAGE_TAG }}
+
+          # Update backend manifests with the correct image tag
+          sed -i "s|image: .*product_service:.*|image: ${{ secrets.AZURE_CONTAINER_REGISTRY }}/product_service:${{ env.IMAGE_TAG }}|g" k8s/product-service.yaml
+          sed -i "s|image: .*order_service:.*|image: ${{ secrets.AZURE_CONTAINER_REGISTRY }}/order_service:${{ env.IMAGE_TAG }}|g" k8s/order-service.yaml
+          sed -i "s|image: .*customer_service:.*|image: ${{ secrets.AZURE_CONTAINER_REGISTRY }}/customer_service:${{ env.IMAGE_TAG }}|g" k8s/customer-service.yaml
+          
+        
+          # Apply all backend configurations
+          kubectl apply -f k8s/configmaps.yaml -f k8s/secrets.yaml -f k8s/product-db.yaml -f k8s/order-db.yaml -f k8s/customer_db.yaml
+          kubectl apply -f k8s/product-service.yaml -f k8s/order-service.yaml -f k8s/customer_service.yaml
+
+      # This step attempts to obtain IPs of deployed backend services
+      - name: Wait for Backend IPs
+        id: get_ips
+        run: |
+          echo "Waiting for Product Service LoadBalancer to be ready..."
+          # Use 'kubectl wait' to pause until the ingress IP is assigned.
+          kubectl wait --for=jsonpath='{.status.loadBalancer.ingress}' service/product-service-w10 --timeout=5m
+
+          echo "Waiting for Order Service LoadBalancer to be ready..."
+          kubectl wait --for=jsonpath='{.status.loadBalancer.ingress}' service/order-service-w10 --timeout=5m
+
+          echo "Waiting for Customer Service LoadBalancer to be ready..."
+          kubectl wait --for=jsonpath='{.status.loadBalancer.ingress}' service/customer-service-w10 --timeout=5m
+
+          echo "Both LoadBalancers are ready. Fetching IPs..."
+          # Now that we know the IPs exist, this 'get' command will succeed immediately.
+          PRODUCT_IP=$(kubectl get service product-service-w10 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          ORDER_IP=$(kubectl get service order-service-w10 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          CUSTOMER_IP=$(kubectl get service customer-service-w10 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          
+          echo "Product Service IP: $PRODUCT_IP"
+          echo "Order Service IP: $ORDER_IP"
+          echo "Customer Service IP: $CUSTOMER_IP"
+
+          echo "PRODUCT_API_IP=$PRODUCT_IP" >> $GITHUB_ENV
+          echo "ORDER_API_IP=$ORDER_IP" >> $GITHUB_ENV
+          echo "CUSTOMER_API_IP=$CUSTOMER_IP" >> $GITHUB_ENV
+
+      # This step updates frontend code, builds and pushes the image, updates anifest and applies configuration
+      # The patterns must match in frontend manifest to update correct image tag as well as correct IPs
+      - name: Configure, Build and Deploy Frontend
+        run: |
+          # 1. Inject backend IPs into the checked-out source code
+          sed -i "s|_PRODUCT_API_URL_|http://${{ env.PRODUCT_API_IP }}:8000|g" frontend/main.js
+          sed -i "s|_ORDER_API_URL_|http://${{ env.ORDER_API_IP }}:8001|g" frontend/main.js
+          sed -i "s|_CUSTOMER_API_URL_|http://${{ env.CUSTOMER_API_IP }}:8002|g" frontend/main.js
+
+          # 2. Build and push a frontend image with a unique deployment tag
+          docker build -t ${{ secrets.AZURE_CONTAINER_REGISTRY }}/frontend:${{ env.IMAGE_TAG }} ./frontend/
+          docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/frontend:${{ env.IMAGE_TAG }}
+
+          # 3. Update frontend manifest with the new deployed tag
+          sed -i "s|image:.*frontend:.*|image: ${{ secrets.AZURE_CONTAINER_REGISTRY }}/frontend:${{ env.IMAGE_TAG }}|g" k8s/frontend.yaml
+
+          # 4. Deploy the configured frontend
+          kubectl apply -f k8s/frontend.yaml
+
+      - name: Deploy Monitoring Services
+        run: |
+          kubectl apply -f k8s/prometheus-configmap.yaml
+          kubectl apply -f k8s/prometheus-rbac.yaml
+          kubectl apply -f k8s/prometheus-deployment.yaml
+          kubectl apply -f k8s/grafana-deployment.yaml
+
+      # This step ensures that we logout from GitHub's VM
+      - name: Azure Logout
+        if: always()
+        run: az logout
