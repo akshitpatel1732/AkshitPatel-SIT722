@@ -12,6 +12,10 @@ on:
       - 'backend/**'
       - 'frontend/**'
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   deploy_and_test_staging:
     name: Create, Deploy, Test, and Destroy Staging
